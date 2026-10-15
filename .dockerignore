@@ -1,0 +1,16 @@
+# No entran en la imagen (se montan como volúmenes o son artefactos locales)
+.git
+.gitignore
+.dockerignore
+.env
+.envrc
+data/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.md
+*.pdf
+docker-compose*.yml

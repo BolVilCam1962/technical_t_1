@@ -1,0 +1,24 @@
+# --- API core ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+
+# --- Vector DB + embeddings ---
+chromadb>=0.5,<2.0
+sentence-transformers>=3.0,<4.0
+
+# --- Memoria / caché ---
+redis>=5.0,<7.0
+
+# --- HTTP + LLM ---
+httpx>=0.27,<1.0
+openai>=1.40,<3.0
+# Drop-in wrapper de OpenAI con trazas en Langfuse (opcional, LANGFUSE_ENABLED)
+langfuse>=2.60
+
+# --- Ingesta del reglamento (PDF) ---
+pypdf>=4.2,<7.0
+
+# --- Métricas ---
+prometheus-client>=0.20,<1.0

@@ -1,0 +1,20 @@
+{"question": "¿Cómo funciona el mana y de qué colores hay?", "expected_rule": "106"}
+{"question": "¿Qué es la prioridad y cuándo puedo lanzar hechizos?", "expected_rule": "117"}
+{"question": "¿Qué es una carta de tipo criatura?", "expected_rule": "302"}
+{"question": "¿Qué es un instantáneo y cuándo puedo lanzarlo?", "expected_rule": "304"}
+{"question": "¿Qué es la pila (stack) y cómo funciona?", "expected_rule": "405"}
+{"question": "¿Qué es la zona de exilio?", "expected_rule": "406"}
+{"question": "¿Qué pasa durante la fase principal (main phase)?", "expected_rule": "505"}
+{"question": "¿Cuándo se roba la carta del turno (draw step)?", "expected_rule": "504"}
+{"question": "¿Cómo se declaran los atacantes?", "expected_rule": "508"}
+{"question": "¿Cómo se declaran los bloqueadores?", "expected_rule": "509"}
+{"question": "¿Cómo se asigna y resuelve el daño de combate?", "expected_rule": "510"}
+{"question": "¿Cómo se lanza un hechizo?", "expected_rule": "601"}
+{"question": "¿Qué es una habilidad activada?", "expected_rule": "602"}
+{"question": "¿Qué es una habilidad disparada (triggered ability)?", "expected_rule": "603"}
+{"question": "¿Cómo se resuelve un hechizo o habilidad de la pila?", "expected_rule": "608"}
+{"question": "¿Cómo funcionan los efectos continuos y las capas?", "expected_rule": "613"}
+{"question": "¿Qué significa dañar primero (first strike)?", "expected_rule": "702.7"}
+{"question": "¿Cómo funciona volar (flying)?", "expected_rule": "702.9"}
+{"question": "¿Qué significa prisa (haste)?", "expected_rule": "702.10"}
+{"question": "¿Cómo funciona el formato Commander?", "expected_rule": "903"}
