@@ -1,0 +1,272 @@
+# ARQUITECTURA.md §3: dos servicios siempre arriba (app + redis) y dos
+# one-shot bajo el perfil "tools" (ingesta del reglamento y evaluación).
+#
+#   docker compose up -d                          # app + redis
+#   docker compose --profile tools run --rm ingest # indexar el reglamento
+#   docker compose --profile tools run --rm eval   # evaluar el retrieval
+
+name: mtg-chatbot
+
+x-app-env: &app-env
+  CHROMA_DIR: /app/data/chroma
+  REDIS_URL: redis://redis:6379/0
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
+  LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  app:
+    build: .
+    container_name: mtg-chatbot-app
+    ports:
+      - "8000:8000"
+    environment: *app-env
+    volumes:
+      # Índice ChromaDB compartido con los one-shot (crea ./data antes: mkdir -p data)
+      - ./data:/app/data
+      # Caché del modelo de embeddings (~470 MB, se descarga una sola vez)
+      - hf-cache:/app/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: mtg-chatbot-redis
+    # Caché + historial volátil: LRU evita desbordar la memoria del demo.
+    # En producción: --appendonly yes (persistencia) y maxmemory-policy noeviction.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # One-shot: indexa el reglamento en ChromaDB. Ejecutar ANTES del primer
+  # `up` (o reiniciar app después de re-ingestar, para que relea el índice).
+  ingest:
+    build: .
+    profiles: ["tools"]
+    environment: *app-env
+    volumes:
+      - ./data:/app/data
+      - hf-cache:/app/.cache/huggingface
+      # El PDF no entra en la imagen (.dockerignore): se monta desde el repo.
+      - "./MagicCompRules 20260417.pdf:/app/rules/MagicCompRules.pdf:ro"
+    command: ["python", "scripts/ingest_rules.py", "--pdf", "/app/rules/MagicCompRules.pdf"]
+
+  # One-shot: evaluación del retrieval (golden set ES->EN). Exit 1 si no pasa
+  # el umbral — pensado para CI.
+  eval:
+    build: .
+    profiles: ["tools"]
+    environment: *app-env
+    volumes:
+      - ./data:/app/data
+      - hf-cache:/app/.cache/huggingface
+      - ./eval:/app/eval:ro
+    command: ["python", "scripts/eval_retrieval.py", "--golden", "/app/eval/golden_set.jsonl"]
+
+  # One-shot: evaluación end-to-end del /chat con promptfoo (justificación
+  # determinista + opcionales llm-rubric con clave). ARQUITECTURA.md §7.5.
+  # Requiere que la app esté arriba y el índice ingestado.
+  promptfoo:
+    image: node:22-alpine
+    profiles: ["tools"]
+    working_dir: /eval
+    volumes:
+      - ./eval:/eval:ro
+      - promptfoo-cache:/root/.npm
+    environment:
+      # Para los asserts llm-rubric (jueces LLM): reutiliza la clave del LLM.
+      OPENAI_API_KEY: ${LLM_API_KEY:-}
+      # Doble juez (eval/promptfoojudges.yaml): dos familias distintas dan el
+      # mejor consenso; defaults con dos modelos OpenAI para zero-config.
+      JUDGE_1: ${JUDGE_1:-openai:gpt-4o-mini}
+      JUDGE_2: ${JUDGE_2:-openai:gpt-4o}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    depends_on: [app]
+    command: sh -c "npx -y promptfoo@latest eval --config /eval/promptfooconfig.yaml"
+
+  # ==========================================================================
+  # Perfil "observability" (opcional): métricas + logs + trazas LLM.
+  #   docker compose --profile observability up -d
+  #   Grafana  http://localhost:3001  (admin/admin)
+  #   Dozzle   http://localhost:8081  (logs de contenedores en vivo)
+  #   Langfuse http://localhost:3000  (trazas/coste LLM; ver README)
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["observability"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["observability"]
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  # Logs de todos los contenedores en vivo (lectura del socket de Docker).
+  dozzle:
+    image: amir20/dozzle:latest
+    profiles: ["observability"]
+    ports:
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  # --- Langfuse v3 self-hosted (trazas de LLM: prompt, tokens, coste) -------
+  # Stack completo: web + worker + postgres + clickhouse + minio + redis.
+  # Primera vez: sign up en http://localhost:3000 y crear claves de API
+  # (ver README §Observabilidad). Alternativa sin contenedores: Langfuse Cloud.
+  langfuse-web:
+    image: langfuse/langfuse:3
+    profiles: ["observability"]
+    ports:
+      - "3000:3000"
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://postgres:postgres@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      S3_ENDPOINT: http://langfuse-minio:9000
+      S3_BUCKET: langfuse
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: miniosecret
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "1"
+      LANGFUSE_S3_EVENT_UPLOAD: "1"
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
+      ENCRYPTION_KEY: 6f7a1c0e9b2d4f68a3c5e7190b8d2f4a6c8e0b2d4f68a3c5e7190b8d2f4a6c8e
+      SALT: 6f7a1c0e9b2d4f68a3c5e7190b8d2f4a6c8e0b2d4f68a3c5e7190b8d2f4a6c8e
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: 5d8f2a6b9c1e4f7a0d3b6c9e2f5a8d1b4c7e0f3a6d9b2c5e8f1a4d7b0c3e6f9
+      TELEMETRY_ENABLED: "false"
+      # Valores DEMO: sustitúyelos por `openssl rand -base64 32` en producción.
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_started
+      langfuse-minio:
+        condition: service_started
+      langfuse-redis:
+        condition: service_started
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse:3
+    profiles: ["observability"]
+    command: ["node", "worker/scripts/entry.js"]
+    environment: *langfuse-env
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_started
+      langfuse-minio:
+        condition: service_started
+      langfuse-redis:
+        condition: service_started
+    restart: unless-stopped
+
+  langfuse-postgres:
+    image: postgres:16-alpine
+    profiles: ["observability"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.1.1-alpine
+    profiles: ["observability"]
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DB: langfuse
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+    restart: unless-stopped
+
+  langfuse-minio:
+    image: bitnami/minio:latest
+    profiles: ["observability"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse-minio-data:/data
+    restart: unless-stopped
+
+  # Crea el bucket de Langfuse en MinIO la primera vez.
+  langfuse-minio-init:
+    image: minio/mc:latest
+    profiles: ["observability"]
+    depends_on: [langfuse-minio]
+    entrypoint: >
+      /bin/sh -c "
+      until (mc alias set s3 http://langfuse-minio:9000 minio miniosecret) do sleep 2; done;
+      mc mb s3/langfuse --ignore-existing;
+      exit 0;
+      "
+
+  langfuse-redis:
+    image: redis:7-alpine
+    profiles: ["observability"]
+    command: ["redis-server"]
+    volumes:
+      - langfuse-redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  redis-data:
+  promptfoo-cache:
+  grafana-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-clickhouse-logs:
+  langfuse-minio-data:
+  langfuse-redis-data:

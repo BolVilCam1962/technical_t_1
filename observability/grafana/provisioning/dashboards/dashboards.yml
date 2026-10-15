@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: mtg-chatbot
+    folder: MTG Chatbot
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

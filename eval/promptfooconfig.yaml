@@ -1,0 +1,119 @@
+# Evaluación end-to-end del chatbot con promptfoo (ARQUITECTURA.md §7.5).
+#
+# A diferencia de scripts/eval_retrieval.py (que mide SOLO el retrieval),
+# esto evalúa el endpoint /chat completo por HTTP: agente + herramientas +
+# respuesta final. Funciona en modo demo (LLM_PROVIDER=mock) porque los asserts
+# de justificación son deterministas; con LLM real se pueden añadir asserts de
+# calidad (llm-rubric, factuality, contains) — ver ejemplos comentados abajo.
+#
+#   docker compose --profile tools run --rm promptfoo
+#
+# (Alternativa considerada: deepeval — métricas pytest-native con LLM-judge.
+#  Elegimos promptfoo por evaluar la API de verdad en negro y por sus asserts
+#  deterministas sin coste de tokens.)
+
+description: "MTG chatbot — justificación y calidad de respuestas (/chat)"
+
+prompts: ["{{question}}"]
+
+providers:
+  - id: http://app:8000/chat
+    label: mtg-chatbot
+    config:
+      method: POST
+      headers:
+        Content-Type: application/json
+      # session_id único por pregunta: sin "sangrado" de historial entre tests.
+      body:
+        session_id: "eval-{{question}}"
+        message: "{{question}}"
+      transformResponse: "JSON.stringify(json)"
+
+defaultTest:
+  assert:
+    - type: javascript
+      value: |
+        const r = JSON.parse(output);
+        if (!r.answer || r.answer.length < 10) { return 'respuesta vacía'; }
+        if (!r.trace_id) { return 'sin trace_id'; }
+        return true;
+    - type: latency
+      threshold: 30000
+
+tests:
+  # --- R1: dudas de reglas con justificación (citas a reglas) ---
+  - description: "R1 — fases del turno"
+    vars: { question: "¿Qué fases hay en un turno de Magic?" }
+    assert: &cite-assert
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          if (!r.citations?.length) { return 'sin citas: no cumple el requisito de justificación'; }
+          // Cada cita debe traer identificador (número de regla NNN o término
+          // del glosario, el puente ES->EN) y el texto que la sustenta.
+          const invalid = r.citations.filter(c => !String(c.rule_number || '').trim() || !c.text);
+          if (invalid.length) { return 'citas sin identificador o sin texto de la regla'; }
+          return true;
+
+  - description: "R1 — cómo funciona el mana"
+    vars: { question: "¿Cómo funciona el mana en Magic?" }
+    assert: *cite-assert
+
+  - description: "R1 — dañar primero (keyword)"
+    vars: { question: "¿Qué significa dañar primero?" }
+    assert: *cite-assert
+
+  # --- R2: interacción (dañar primero + daño ya asignado) ---
+  - description: "R2 — interacción: daño de combate ya asignado"
+    vars:
+      question: "Mi criatura con dañar primero ya hizo su daño; si el rival la destruye después, ¿el daño se aplicó igual?"
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          if (!r.citations?.length) { return 'sin citas'; }
+          const nums = r.citations.map(c => c.rule_number);
+          // Reglas de combate (5xx) o keyword (702.x), o términos del glosario
+          // (no numéricos: "First Strike", "Assign Combat Damage"...).
+          if (!nums.some(n => /^5\d\d/.test(n) || /^702/.test(n) || isNaN(parseInt(n, 10)))) {
+            return 'citas no relacionadas con combate/keywords: ' + nums.join(',');
+          }
+          return true;
+
+  # --- R3/R4: requieren LLM real (function calling); en mock se saltan ---
+  - description: "R3 — búsqueda de cartas (requiere LLM real)"
+    vars:
+      question: "Busco una carta blanca de coste inferior a dos de mana que sea guerrero"
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          if (r.llm_provider === 'mock') { return true; }  // modo demo: skip
+          if (r.intent !== 'card_search') { return 'intent esperado card_search, got ' + r.intent; }
+          if (!r.cards?.length) { return 'no encontró cartas'; }
+          if (!r.cards.every(c => c.colors.includes('W'))) { return 'cartas no blancas: ' + r.cards.map(c=>c.name).join(','); }
+          return true;
+
+  - description: "R4 — carta custom (requiere LLM real)"
+    vars:
+      question: "Quiero una carta de Han Solo, blanca-roja, que tenga dañar primero"
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          if (r.llm_provider === 'mock') { return true; }  // modo demo: skip
+          const card = r.cards?.find(c => c.is_custom);
+          if (!card) { return 'no generó carta custom'; }
+          if (!card.colors.every(c => ['W', 'R'].includes(c))) { return 'colores incorrectos'; }
+          if (!/first strike/i.test(card.text)) { return 'la carta no tiene dañar primero'; }
+          return true;
+
+  # --- Calidad semántica (SOLO con LLM real + OPENAI_API_KEY para el juez).
+  #     Descomenta para la evaluación de calidad además de la de contrato:
+  # - description: "R1 — calidad de la respuesta sobre fases del turno"
+  #   vars: { question: "¿Qué fases hay en un turno de Magic?" }
+  #   assert:
+  #     - type: llm-rubric
+  #       value: "La respuesta lista las cinco fases de un turno de MTG (beginning, precombat main, combat, postcombat main, ending) y cita números de regla"
+  #     - type: contains
+  #       value: "fase"

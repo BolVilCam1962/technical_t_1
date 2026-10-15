@@ -1,0 +1,143 @@
+# Evaluación de CALIDAD con DOBLE JUEZ LLM (ARQUITECTURA.md §7.5).
+#
+# Frente a promptfooconfig.yaml (asserts deterministas del contrato), aquí cada
+# test se evalúa con DOS jueces independientes usando los MISMOS criterios
+# (misma rúbrica vía anchor YAML). Mitiga el sesgo de un único evaluador:
+# un test solo aprueba si ambos jueces están de acuerdo (inter-rater agreement).
+#
+#   docker compose --profile tools run --rm promptfoo \
+#     npx -y promptfoo@latest eval --config /eval/promptfoojudges.yaml
+#
+# Requisitos:
+# - El chatbot debe correr con LLM real (LLM_PROVIDER=openai): en modo mock las
+#   respuestas de demo no pasarían la rúbrica de calidad.
+# - Jueces (defaults en docker-compose, sobreescribibles en .env):
+#     JUDGE_1=openai:gpt-4o-mini     (juez "barato")
+#     JUDGE_2=openai:gpt-4o          (juez "potente")
+#   El valor real está en jueces de FAMILIAS distintas, p. ej.:
+#     JUDGE_2=anthropic:claude-sonnet-4-5   (+ ANTHROPIC_API_KEY en .env)
+#     JUDGE_2=groq:llama-3.3-70b-versatile  (+ GROQ_API_KEY en .env)
+#
+# Consenso: `threshold: 0.99` exige que AMBOS jueces aprueben (media de los dos
+# asserts llm-rubric = 1.0). Baja a 0.5 para "al menos uno aprueba".
+
+description: "MTG chatbot — calidad de respuestas con doble juez (consenso)"
+
+prompts: ["{{question}}"]
+
+providers:
+  - id: http://app:8000/chat
+    label: mtg-chatbot
+    config:
+      method: POST
+      headers:
+        Content-Type: application/json
+      body:
+        session_id: "judge-{{question}}"
+        message: "{{question}}"
+      # Al juez le llega: respuesta + citas (números de regla) + cartas encontradas.
+      transformResponse: "json.answer + '\\n\\n[ Citas: ' + (json.citations || []).map(c => c.rule_number).join(', ') + ' ]\\n[ Cartas: ' + (json.cards || []).map(c => c.name + ' (' + c.colors + ') ' + c.type_line).join(' ; ') + ' ]'"
+
+# Juez 1 como default para cualquier model-graded assert sin provider propio.
+defaultTest:
+  options:
+    provider: ${JUDGE_1}
+  # Ambos jueces deben aprobar (media >= 0.99). "Al menos uno": 0.5.
+  threshold: 0.99
+
+tests:
+  # --- R1: reglas básicas -----------------------------------------------------
+  - description: "R1 — fases del turno (doble juez)"
+    vars: { question: "¿Qué fases hay en un turno de Magic?" }
+    assert:
+      - type: llm-rubric
+        provider: ${JUDGE_1}
+        value: &rubric-fases |
+          Eres un juez experto en Magic: The Gathering. Evalúa la respuesta según:
+          (1) menciona las cinco fases de un turno (inicio, precombate principal,
+          combate, postcombate principal, final) o un equivalente razonable;
+          (2) justifica citando al menos un número de regla del reglamento
+          (sección [ Citas: ... ]);
+          (3) no inventa reglas ni números.
+          Aprueba SOLO si se cumplen los tres criterios.
+      - type: llm-rubric
+        provider: ${JUDGE_2}
+        value: *rubric-fases
+
+  # --- R2: interacción entre cartas --------------------------------------------
+  - description: "R2 — dañar primero + daño ya resuelto (doble juez)"
+    vars:
+      question: "Mi criatura con dañar primero ya hizo su daño de combate; si el rival la destruye después, ¿el daño se aplicó igual?"
+    assert:
+      - type: llm-rubric
+        provider: ${JUDGE_1}
+        value: &rubric-interaccion |
+          Eres un juez experto en Magic: The Gathering. Evalúa la respuesta según:
+          (1) explica (correctamente o con una base razonable) que el daño de
+          combate ya asignado y resuelto no se deshace aunque la criatura muera
+          o salga del combate después, o razona de forma coherente con las reglas
+          que cita;
+          (2) justifica con reglas relevantes (p. ej. daño de combate 510.x,
+          dañar primero 702.7) visibles en [ Citas: ... ];
+          (3) no inventa reglas ni números.
+          Aprueba SOLO si se cumplen los tres criterios.
+      - type: llm-rubric
+        provider: ${JUDGE_2}
+        value: *rubric-interaccion
+
+  # --- R3: búsqueda de cartas ---------------------------------------------------
+  - description: "R3 — carta blanca guerrera barata (doble juez)"
+    vars:
+      question: "Busco una carta blanca de coste inferior a dos de mana que sea guerrero"
+    assert:
+      - type: llm-rubric
+        provider: ${JUDGE_1}
+        value: &rubric-cartas |
+          Eres un juez experto en Magic: The Gathering. Evalúa la respuesta según:
+          (1) presenta una o más cartas de la sección [ Cartas: ... ] que sean
+          blancas (W) y de coste convertido ≤ 2 y de subtipo Warrior/guerrero,
+          o explica honestamente que no encontró ninguna;
+          (2) explica qué filtros aplicó a la búsqueda;
+          (3) ninguna carta presentada viola los filtros pedidos.
+          Aprueba SOLO si se cumplen los tres criterios.
+      - type: llm-rubric
+        provider: ${JUDGE_2}
+        value: *rubric-cartas
+
+  # --- R4: carta custom (bonus) -------------------------------------------------
+  - description: "R4 — carta custom Han Solo blanca-roja con dañar primero (doble juez)"
+    vars:
+      question: "Quiero una carta de Han Solo, blanca-roja, que tenga dañar primero"
+    assert:
+      - type: llm-rubric
+        provider: ${JUDGE_1}
+        value: &rubric-custom |
+          Eres un juez experto en Magic: The Gathering. Evalúa la respuesta según:
+          (1) genera una carta custom con nombre, coste de mana, línea de tipo y
+          texto de reglas (sección [ Cartas: ... ]);
+          (2) sus colores incluyen blanco y rojo (W y R);
+          (3) contiene la habilidad dañar primero (First Strike) en su texto;
+          (4) si menciona la regla de dañar primero, usa un número real (702.7).
+          Aprueba SOLO si se cumplen los cuatro criterios.
+      - type: llm-rubric
+        provider: ${JUDGE_2}
+        value: *rubric-custom
+
+  # --- Honestidad: fuera de scope ----------------------------------------------
+  - description: "Honestidad — pregunta fuera de scope (doble juez)"
+    vars:
+      question: "¿Me recomiendas una película para esta noche?"
+    assert:
+      - type: llm-rubric
+        provider: ${JUDGE_1}
+        value: &rubric-scope |
+          Eres un juez que evalúa asistentes de un call center de Magic: The
+          Gathering. Evalúa la respuesta según:
+          (1) NO inventa reglas de Magic ni números de regla para contestar
+          algo que no está en el reglamento;
+          (2) redirige amablemente la conversación a su propósito (reglas y
+          cartas de Magic) o declara que está fuera de su ámbito.
+          Aprueba SOLO si se cumplen los dos criterios.
+      - type: llm-rubric
+        provider: ${JUDGE_2}
+        value: *rubric-scope

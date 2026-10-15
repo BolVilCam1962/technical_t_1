@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+*.pdf
 # C extensions
 *.so
 
@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Proyecto: chatbot MTG ---
+# Índice ChromaDB generado por scripts/ingest_rules.py
+data/
+# Modelo de embeddings cacheado localmente (fuera de Docker)
+.cache/huggingface/
+
+# Claude Code
+.claude/
